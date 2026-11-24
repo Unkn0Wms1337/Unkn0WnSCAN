@@ -1,0 +1,7 @@
+telethon>=1.36,<2
+python-socks[asyncio]>=2.4
+aiohttp>=3.9
+curl-cffi>=0.10
+playwright>=1.49
+python-dotenv>=1.0
+pillow>=10

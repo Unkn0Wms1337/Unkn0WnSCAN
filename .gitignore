@@ -1,0 +1,15 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+data/
+*.db
+*.db-shm
+*.db-wal
+*.session
+*.session-journal
+avito_*.html
+api_sample.txt
+*.log
+bot.pid
+CHECKPOINT.md

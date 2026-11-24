@@ -1,0 +1,10 @@
+.git
+.gitignore
+.venv
+.env
+data
+__pycache__
+*.pyc
+tests
+avito_*.html
+api_sample.txt
