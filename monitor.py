@@ -116,6 +116,13 @@ class Monitor:
             await self._initial_scan_locked(subscription, notify=notify)
 
     async def _initial_scan_locked(self, subscription: Subscription, notify: bool) -> None:
+        if self.avito.is_blocked():
+            logger.debug(
+                "Первичная проверка #%s отложена: Avito на паузе ещё %s сек.",
+                subscription.id,
+                self.avito.blocked_seconds_left(),
+            )
+            return
         try:
             listings = await self.avito.fetch_search(subscription.url, self.initial_pages)
         except Exception as exc:
@@ -164,6 +171,15 @@ class Monitor:
             await self._check_locked(subscription)
 
     async def _check_locked(self, subscription: Subscription) -> None:
+        # После блокировки не дёргаем Avito каждую секунду — это только
+        # продлевает блокировку и засоряет лог.
+        if self.avito.is_blocked():
+            logger.debug(
+                "Проверка #%s отложена: Avito на паузе ещё %s сек.",
+                subscription.id,
+                self.avito.blocked_seconds_left(),
+            )
+            return
         try:
             listings = await self.avito.fetch_search(subscription.url, self.check_pages)
         except Exception as exc:
@@ -311,6 +327,7 @@ class Monitor:
                     enriched,
                     market,
                     photo_fetcher=self.avito.fetch_image_bytes,
+                    proxy_url=self.avito.current_proxy(),
                 )
             except FORBIDDEN_ERRORS:
                 logger.warning("Бот заблокирован в чате %s, удаляю подписки", subscription.chat_id)
@@ -352,6 +369,7 @@ class Monitor:
                     item,
                     market,
                     photo_fetcher=self.avito.fetch_image_bytes,
+                    proxy_url=self.avito.current_proxy(),
                 )
             except FORBIDDEN_ERRORS:
                 logger.warning("Бот заблокирован в чате %s, прекращаю поиск", chat_id)

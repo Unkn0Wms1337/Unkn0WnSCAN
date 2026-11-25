@@ -21,10 +21,13 @@ from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlun
 from curl_cffi.requests import AsyncSession
 
 try:  # Playwright опционален: без него остаётся режим curl-cffi.
-    from avito_browser import AvitoBrowser, BrowserFetchError
+    from avito_browser import AvitoBrowser, BrowserFetchError, mask_proxy
 except Exception:  # pragma: no cover
     AvitoBrowser = None  # type: ignore[assignment]
     BrowserFetchError = None  # type: ignore[assignment]
+
+    def mask_proxy(url: str | None) -> str:  # type: ignore[misc]
+        return "нет"
 
 logger = logging.getLogger(__name__)
 
@@ -1220,6 +1223,9 @@ class AvitoClient:
         all_russia: bool = False,
         state_path: str | None = None,
         watch_reload: float = 20.0,
+        browser_proxy: str | None = None,
+        rotate_on_block: bool = True,
+        block_pause_minutes: int = 10,
     ) -> None:
         urls: list[str] = []
         for candidate in list(proxy_urls or []) + ([proxy_url] if proxy_url else []):
@@ -1240,7 +1246,18 @@ class AvitoClient:
         self._block_count = 0
         self._last_reload_at = 0.0
         self._watch_reload = max(15.0, float(watch_reload))
+        self._next_reload_gap = self._watch_reload
         self._force_reload = False
+        # Прокси для браузера: отдельный, иначе первый из общего списка.
+        browser_proxy = (browser_proxy or "").strip() or self._proxy_url
+        self._browser_proxy = browser_proxy
+        self._rotate_on_block = bool(rotate_on_block) and bool(urls)
+        self._block_pause_minutes = max(1, int(block_pause_minutes))
+        self._browser_opts: dict[str, Any] = {
+            "headless": browser_headless,
+            "profile_dir": browser_profile,
+            "timeout_ms": int(self._timeout * 1000),
+        }
         self._state_path = Path(state_path) if state_path else None
         self._load_state()
         self._sessions: dict[str | None, AsyncSession] = {}
@@ -1264,14 +1281,51 @@ class AvitoClient:
         if cookie:
             self._headers["Cookie"] = cookie
 
+        self._use_browser = bool(use_browser) and AvitoBrowser is not None
         self._browser = None
-        if use_browser and AvitoBrowser is not None:
-            self._browser = AvitoBrowser(
-                headless=browser_headless,
-                profile_dir=browser_profile,
-                proxy=self._proxy_url,
-                timeout_ms=int(self._timeout * 1000),
-            )
+        if self._use_browser:
+            self._browser = self._make_browser()
+
+    def _make_browser(self):
+        assert AvitoBrowser is not None
+        return AvitoBrowser(proxy=self._browser_proxy, **self._browser_opts)
+
+    def is_blocked(self) -> bool:
+        return time.time() < self._blocked_until
+
+    def blocked_seconds_left(self) -> int:
+        return max(0, int(self._blocked_until - time.time()))
+
+    def has_proxies(self) -> bool:
+        return bool(self._proxy_urls)
+
+    def current_proxy(self) -> str | None:
+        """Текущий прокси (для картинок и прочих запросов вне браузера)."""
+        return self._proxy_url
+
+    async def rotate_browser_proxy(self) -> str | None:
+        """Перезапускает браузер на следующем прокси из списка.
+
+        Возвращает новый прокси или None, если прокси не настроены.
+        """
+        if not self._proxy_urls or AvitoBrowser is None:
+            return None
+        self._proxy_index = (self._proxy_index + 1) % len(self._proxy_urls)
+        proxy = self._proxy_urls[self._proxy_index]
+        self._proxy_url = proxy
+        self._browser_proxy = proxy
+        if self._browser is not None:
+            try:
+                await self._browser.close()
+            except Exception:  # noqa: BLE001
+                logger.debug("Avito: ошибка закрытия браузера", exc_info=True)
+            self._browser = self._make_browser()
+        logger.warning(
+            "Avito: переключаю браузер на прокси #%s (%s)",
+            self._proxy_index + 1,
+            mask_proxy(proxy),
+        )
+        return proxy
 
     def _session_kwargs(self, proxy: str | None) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
@@ -1354,12 +1408,13 @@ class AvitoClient:
         self._force_reload = True
         self._reset_block()
 
-    def _note_block(self, first_minutes: int = 15) -> None:
+    def _note_block(self, first_minutes: int | None = None) -> None:
         self._block_count += 1
-        # 15 мин, 30, 60, 120 — максимум 2 часа. Не долбим Avito, пока IP
+        # 10 мин, 20, 40, 80, 120 — максимум 2 часа. Не долбим Avito, пока IP
         # заблокирован: иначе блокировка продлевается.
+        first = first_minutes or self._block_pause_minutes
         minutes = min(
-            120, first_minutes * (2 ** (self._block_count - 1))
+            120, first * (2 ** (self._block_count - 1))
         )
         self._blocked_until = time.time() + minutes * 60
         self._save_state()
@@ -1671,6 +1726,20 @@ class AvitoClient:
                 break
         return collected
 
+    async def _on_browser_blocked(self, status: int) -> None:
+        """Реакция на проверку IP/429: пауза и, если есть, смена прокси."""
+        self._note_block()
+        if self._rotate_on_block and await self.rotate_browser_proxy():
+            logger.warning(
+                "Avito: блокировка IP — браузер перезапускаю на следующем прокси"
+            )
+        else:
+            logger.warning(
+                "Avito: проверка IP. Пауза %s мин. Пройдите проверку в открытом "
+                "окне (или добавьте прокси в AVITO_PROXY_URLS).",
+                self._block_pause_minutes,
+            )
+
     async def _fetch_search_browser(self, url: str, pages: int) -> list[Listing]:
         assert self._browser is not None
         all_items: list[Listing] = []
@@ -1680,7 +1749,9 @@ class AvitoClient:
             # её не чаще, чем раз в _watch_reload секунд, а в остальное время
             # просто смотрим DOM. Так браузер остаётся открытым и не долбит Авито.
             if pages == 1:
-                reload = (time.time() - self._last_reload_at) >= self._watch_reload
+                # Интервал с джиттером: ровно каждые N секунд — слишком
+                # заметный для антибота шаблон.
+                reload = (time.time() - self._last_reload_at) >= self._next_reload_gap
                 force = self._force_reload
                 self._force_reload = False
                 if reload or force:
@@ -1688,12 +1759,16 @@ class AvitoClient:
                     # Засекаем время ДО перезагрузки: иначе долгая загрузка
                     # сдвигает следующий цикл и новые лоты приходят позже.
                     self._last_reload_at = time.time()
+                    self._next_reload_gap = self._watch_reload * random.uniform(
+                        0.85, 1.3
+                    )
                 try:
                     raw_items = await self._browser.watch_items(
                         page_url, reload=reload, force=force
                     )
                 except BrowserFetchError as exc:
                     if exc.status in {403, 429, 439}:
+                        await self._on_browser_blocked(exc.status)
                         raise AvitoBlockedError(
                             "Авито показывает проверку IP. Пройдите её в открытом "
                             "браузере — бот продолжит автоматически.",
@@ -1712,6 +1787,7 @@ class AvitoClient:
                     raw_items = await self._browser.fetch_search_items(page_url)
                 except BrowserFetchError as exc:
                     if exc.status in {403, 429, 439}:
+                        await self._on_browser_blocked(exc.status)
                         raise AvitoBlockedError(
                             "Авито показывает проверку IP. Пройдите её в открытом "
                             "браузере — бот продолжит автоматически.",
@@ -1786,6 +1862,11 @@ class AvitoClient:
 
     async def fetch_search(self, url: str, pages: int = 1) -> list[Listing]:
         pages = max(1, pages)
+        if self.is_blocked():
+            left = self.blocked_seconds_left()
+            raise AvitoBlockedError(
+                f"Avito на паузе после блокировки, осталось {left // 60 + 1} мин."
+            )
         if self._all_russia:
             url = to_all_russia(url)
 

@@ -106,6 +106,9 @@ class Config:
     fetch_details: bool
     proxy_url: str | None
     avito_proxy_urls: tuple[str, ...]
+    avito_browser_proxy: str | None
+    avito_rotate_on_block: bool
+    avito_block_pause_minutes: int
     avito_use_browser: bool
     avito_browser_headless: bool
     avito_browser_profile: Path
@@ -153,6 +156,20 @@ def load_config() -> Config:
     if single_avito_proxy and single_avito_proxy not in avito_proxy_urls:
         avito_proxy_urls.insert(0, single_avito_proxy)
 
+    # Список прокси из файла (по одному на строку, # — комментарий).
+    proxy_file = os.getenv("AVITO_PROXY_FILE", "").strip()
+    if proxy_file:
+        proxy_path = Path(proxy_file)
+        if not proxy_path.is_absolute():
+            proxy_path = BASE_DIR / proxy_path
+        try:
+            for line in proxy_path.read_text(encoding="utf-8-sig").splitlines():
+                value = line.strip()
+                if value and not value.startswith("#") and value not in avito_proxy_urls:
+                    avito_proxy_urls.append(value)
+        except OSError:
+            pass
+
     return Config(
         bot_token=token,
         api_id=_env_int("TELEGRAM_API_ID", DEFAULT_API_ID),
@@ -169,6 +186,11 @@ def load_config() -> Config:
         fetch_details=_env_bool("FETCH_DETAILS", True),
         proxy_url=single_avito_proxy or None,
         avito_proxy_urls=tuple(avito_proxy_urls),
+        avito_browser_proxy=os.getenv("AVITO_BROWSER_PROXY", "").strip() or None,
+        avito_rotate_on_block=_env_bool("AVITO_ROTATE_ON_BLOCK", True),
+        avito_block_pause_minutes=_env_int(
+            "AVITO_BLOCK_PAUSE_MINUTES", 10, 1
+        ),
         avito_use_browser=_env_bool("AVITO_USE_BROWSER", True),
         avito_browser_headless=_env_bool("AVITO_BROWSER_HEADLESS", False),
         avito_browser_profile=_path_from_env(

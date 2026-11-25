@@ -123,6 +123,14 @@ def _to_jpeg(content: bytes) -> bytes | None:
         return None
 
 
+def _http_proxy(url: str | None) -> str | None:
+    """aiohttp понимает только HTTP(S)-прокси; socks5 оставляем браузеру."""
+    value = (url or "").strip()
+    if value.startswith(("http://", "https://")):
+        return value
+    return None
+
+
 async def _download_photo(
     session: aiohttp.ClientSession,
     url: str,
@@ -130,13 +138,16 @@ async def _download_photo(
     index: int,
     semaphore: asyncio.Semaphore,
     fetcher=None,
+    proxy: str | None = None,
 ) -> Path | None:
     content: bytes | None = None
     content_type = ""
     if _safe_http_url(url):
         async with semaphore:
             try:
-                async with session.get(url, headers=PHOTO_HEADERS) as response:
+                async with session.get(
+                    url, headers=PHOTO_HEADERS, proxy=_http_proxy(proxy)
+                ) as response:
                     if response.status == 200:
                         content_type = response.headers.get("Content-Type", "")
                         content = await response.read()
@@ -175,7 +186,7 @@ async def _download_photo(
 
 
 async def _download_photos(
-    urls: list[str], directory: Path, fetcher=None
+    urls: list[str], directory: Path, fetcher=None, proxy: str | None = None
 ) -> list[Path]:
     if not urls:
         return []
@@ -188,7 +199,9 @@ async def _download_photos(
     ) as session:
         results = await asyncio.gather(
             *(
-                _download_photo(session, url, directory, index, semaphore, fetcher)
+                _download_photo(
+                    session, url, directory, index, semaphore, fetcher, proxy
+                )
                 for index, url in enumerate(urls[:10])
             ),
             return_exceptions=True,
@@ -215,6 +228,7 @@ async def send_listing(
     listing: Listing,
     market_median: int | None,
     photo_fetcher=None,
+    proxy_url: str | None = None,
 ) -> None:
     """Download photos into a temp folder, send them, then delete them immediately."""
     caption = format_listing_caption(listing, market_median)
@@ -227,7 +241,10 @@ async def send_listing(
             # + кнопка «Открыть объявление». Альбом не используем, иначе
             # Telegram дублирует кнопку под каждой картинкой.
             files = await _download_photos(
-                listing.image_urls[:1], directory, fetcher=photo_fetcher
+                listing.image_urls[:1],
+                directory,
+                fetcher=photo_fetcher,
+                proxy=proxy_url,
             )
             if not files:
                 logger.warning(

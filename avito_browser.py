@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from playwright.async_api import async_playwright
 
@@ -33,6 +34,40 @@ window.chrome = window.chrome || {runtime: {}};
 """
 
 SEARCH_ITEM_SELECTOR = '[data-marker="item"]'
+
+
+def playwright_proxy(url: str | None) -> dict | None:
+    """Превращает прокси-URL в формат Playwright.
+
+    Поддерживаются http://, https:// и socks5://, в том числе с логином:
+    ``socks5://user:pass@1.2.3.4:1080``.
+    """
+    value = (url or "").strip()
+    if not value:
+        return None
+    parts = urlsplit(value if "://" in value else "http://" + value)
+    if not parts.hostname:
+        return None
+    server = f"{parts.scheme}://{parts.hostname}"
+    if parts.port:
+        server += f":{parts.port}"
+    proxy: dict = {"server": server}
+    if parts.username:
+        proxy["username"] = unquote(parts.username)
+        proxy["password"] = unquote(parts.password or "")
+    return proxy
+
+
+def mask_proxy(url: str | None) -> str:
+    """Прокси без логина/пароля — чтобы не светить их в логах."""
+    value = (url or "").strip()
+    if not value:
+        return "нет (напрямую)"
+    parts = urlsplit(value if "://" in value else "http://" + value)
+    if not parts.hostname:
+        return "некорректный"
+    host = parts.hostname + (f":{parts.port}" if parts.port else "")
+    return f"{parts.scheme}://{host}"
 
 EXTRACT_SEARCH_ITEMS_JS = """
 () => {
@@ -205,8 +240,9 @@ class AvitoBrowser:
         }
         if not self._headless:
             launch_kwargs["args"].append("--start-maximized")
-        if self._proxy:
-            launch_kwargs["proxy"] = {"server": self._proxy}
+        proxy = playwright_proxy(self._proxy)
+        if proxy:
+            launch_kwargs["proxy"] = proxy
         viewport = None if not self._headless else {"width": 1366, "height": 768}
         if self._profile_dir:
             Path(self._profile_dir).mkdir(parents=True, exist_ok=True)
@@ -227,10 +263,15 @@ class AvitoBrowser:
         await self._context.add_init_script(STEALTH_SCRIPT)
         self._context.set_default_timeout(self._timeout_ms)
         logger.info(
-            "Avito: запущен браузер (headless=%s, профиль=%s)",
+            "Avito: запущен браузер (headless=%s, профиль=%s, прокси=%s)",
             self._headless,
             self._profile_dir or "временный",
+            mask_proxy(self._proxy),
         )
+
+    def set_proxy(self, proxy: str | None) -> None:
+        """Меняет прокси. Применяется только после close()/перезапуска."""
+        self._proxy = (proxy or "").strip() or None
 
     async def _new_page(self):
         page = await self._context.new_page()

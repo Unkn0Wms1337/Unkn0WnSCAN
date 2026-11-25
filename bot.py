@@ -463,6 +463,9 @@ async def run(config: Config) -> None:
         all_russia=config.avito_all_russia,
         state_path=str(config.avito_state_path),
         watch_reload=config.avito_reload_seconds,
+        browser_proxy=config.avito_browser_proxy,
+        rotate_on_block=config.avito_rotate_on_block,
+        block_pause_minutes=config.avito_block_pause_minutes,
     )
     client = build_telegram_client(config)
     monitor: Monitor | None = None
