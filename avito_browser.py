@@ -341,6 +341,39 @@ class AvitoBrowser:
         lowered = (body or "").casefold()
         return any(marker in lowered for marker in BLOCK_MARKERS)
 
+    async def _try_pass_challenge(self, page) -> bool:
+        """Пробует нажать «Пройти проверку», если Авито её показал.
+
+        Лёгкая PoW-проверка («проверка безопасности») проходит сама, её не
+        трогаем. Кнопка «Пройти проверку» открывает капчу — если она есть,
+        нажимаем, чтобы человеку было проще её пройти в открытом окне.
+        """
+        try:
+            body = (await self._body_text(page)).casefold()
+        except Exception:
+            return False
+        if "пройти проверку" not in body:
+            return False
+        try:
+            button = page.get_by_text("Пройти проверку", exact=True).first
+            if not await button.count():
+                return False
+            await button.click(timeout=2500)
+            logger.info("Avito: нажал «Пройти проверку» — пройдите капчу в окне")
+            await asyncio.sleep(2.0)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _wait_items(self, page, timeout_ms: int) -> list[dict]:
+        """Ждёт карточки, давая антибот-проверке время пройти самой."""
+        try:
+            await page.wait_for_selector(SEARCH_ITEM_SELECTOR, timeout=timeout_ms)
+        except Exception:
+            pass
+        await asyncio.sleep(0.4)
+        return await self._extract_items(page)
+
     async def watch_items(
         self,
         url: str,
@@ -362,27 +395,45 @@ class AvitoBrowser:
                 current = (page.url or "").split("#")[0].rstrip("/")
                 current_lower = current.casefold()
                 on_captcha_page = "firewall" in current_lower or "captcha" in current_lower
+                on_target = current == target
 
                 items = await self._extract_items(page)
-                if items and not reload and not force:
+                if on_target and items and not reload and not force:
                     return items
 
-                body = "" if items else await self._body_text(page)
-                if (
-                    not force
-                    and not items
-                    and (on_captcha_page or self._is_challenge(body))
-                ):
-                    # Не трогаем страницу — пусть человек пройдёт проверку.
+                body = "" if (on_target and items) else await self._body_text(page)
+                on_challenge = on_captcha_page or self._is_challenge(body)
+
+                # Проверка IP на главной/чужой странице не значит, что закрыта
+                # выдача: Авито часто пускает на конкретный поиск. Поэтому
+                # сначала пробуем открыть целевой URL, и только если капча уже
+                # на нём — ждём ручного прохождения.
+                if on_target and not force and not items and on_challenge:
+                    # Лёгкая проверка («проверка безопасности») проходит сама
+                    # за несколько секунд. Даём ей время, а капчу предлагаем
+                    # пройти человеку в открытом окне.
+                    logger.info("Avito: проверка безопасности, жду прохождения")
+                    items = await self._wait_items(page, 12000)
+                    if items:
+                        return items
+                    await self._try_pass_challenge(page)
+                    items = await self._wait_items(page, 12000)
+                    if items:
+                        return items
                     raise BrowserFetchError(
                         "Avito показывает проверку IP",
                         status=429,
                     )
 
                 if current != target or force:
-                    response = await page.goto(
-                        url, wait_until="domcontentloaded", timeout=self._timeout_ms
-                    )
+                    try:
+                        response = await page.goto(
+                            url, wait_until="domcontentloaded", timeout=self._timeout_ms
+                        )
+                    except Exception:
+                        # Не удалось уйти с капчи/главной — не считаем это
+                        # блокировкой поиска, отдадим пустой результат.
+                        response = None
                     if (
                         response is not None
                         and response.status >= 400
@@ -392,11 +443,10 @@ class AvitoBrowser:
                             f"Avito вернул HTTP {response.status}",
                             status=response.status,
                         )
-                    try:
-                        await page.wait_for_selector(SEARCH_ITEM_SELECTOR, timeout=20000)
-                    except Exception:
-                        pass
-                    await asyncio.sleep(0.5)
+                    await self._try_pass_challenge(page)
+                    items = await self._wait_items(page, 25000)
+                    if items:
+                        return items
                 elif reload:
                     logger.info("Avito: авто-обновление страницы поиска")
                     try:
@@ -406,13 +456,10 @@ class AvitoBrowser:
                         )
                     except Exception:
                         pass
-                    try:
-                        await page.wait_for_selector(
-                            SEARCH_ITEM_SELECTOR, timeout=reload_wait_ms
-                        )
-                    except Exception:
-                        pass
-                    await asyncio.sleep(0.4)
+                    await self._try_pass_challenge(page)
+                    items = await self._wait_items(page, reload_wait_ms)
+                    if items:
+                        return items
 
                 await asyncio.sleep(0.3)
                 items = await self._extract_items(page)
@@ -420,6 +467,10 @@ class AvitoBrowser:
                     return items
                 body = await self._body_text(page)
                 if self._is_challenge(body):
+                    # Последний шанс: иногда PoW отвечает чуть позже.
+                    items = await self._wait_items(page, 10000)
+                    if items:
+                        return items
                     raise BrowserFetchError(
                         "Avito показывает проверку IP",
                         status=429,

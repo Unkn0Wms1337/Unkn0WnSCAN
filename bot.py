@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import re
 from datetime import datetime
 from html import escape
@@ -518,6 +519,45 @@ async def run(config: Config) -> None:
         await client.disconnect()
 
 
+def _acquire_instance_lock(path):
+    """Не даёт запустить второй экземпляр: иначе Telethon-сессия ломается.
+
+    Возвращает открытый файл (держит блокировку), False — если уже занято,
+    или None — если платформа не поддерживает msvcrt/fcntl.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import msvcrt
+    except ImportError:  # pragma: no cover - Linux/macOS
+        try:
+            import fcntl
+        except ImportError:
+            return None
+        handle = open(path, "a+")  # noqa: SIM115
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return False
+        handle.seek(0)
+        handle.truncate()
+        handle.write(str(os.getpid()))
+        handle.flush()
+        return handle
+    handle = open(path, "a+")  # noqa: SIM115
+    try:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        handle.close()
+        return False
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
+
+
 def main() -> None:
     import time
 
@@ -534,6 +574,13 @@ def main() -> None:
     )
     # Если прокси/сеть временно пропали, Telethon завершает работу.
     # Не выходим, а перезапускаемся с паузой.
+    instance_lock = _acquire_instance_lock(config.db_path.parent / "bot.lock")
+    if instance_lock is False:
+        logger.error(
+            "Бот уже запущен (data/bot.lock). Закройте второй экземпляр — "
+            "иначе Telegram отзовёт ключ сессии."
+        )
+        return
     while True:
         try:
             asyncio.run(run(config))

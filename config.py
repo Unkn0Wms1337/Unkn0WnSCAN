@@ -200,7 +200,7 @@ def load_config() -> Config:
         avito_state_path=_path_from_env(
             "AVITO_STATE_PATH", BASE_DIR / "data" / "avito_state.json"
         ),
-        avito_reload_seconds=_env_float("AVITO_RELOAD_SECONDS", 20.0, 15.0),
+        avito_reload_seconds=_env_float("AVITO_RELOAD_SECONDS", 20.0, 8.0),
         avito_fresh_hours=_env_float("AVITO_FRESH_HOURS", 24.0, 0.5),
         avito_cookie=os.getenv("AVITO_COOKIE", "").strip() or None,
         avito_timeout=_env_float("AVITO_TIMEOUT_SECONDS", 45.0, 20.0),
