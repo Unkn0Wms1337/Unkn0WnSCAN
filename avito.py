@@ -40,6 +40,11 @@ except Exception:  # pragma: no cover
     ProxyDiscovery = None  # type: ignore[assignment]
     load_cached = save_cached = validate_proxy = None  # type: ignore[assignment]
 
+try:  # Обход через Cloudflare WARP (подход openhop).
+    import warp_hop as warp_hop_lib
+except Exception:  # pragma: no cover
+    warp_hop_lib = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 AVITO_HOSTS = ("avito.ru", "www.avito.ru", "m.avito.ru")
@@ -1241,6 +1246,10 @@ class AvitoClient:
         proxy_cache_path: str | None = None,
         proxy_scan_limit: int = 450,
         proxy_scan_workers: int = 100,
+        warp_hop: bool = False,
+        warp_primary: bool = False,
+        warp_proxy: str = "socks5://127.0.0.1:40000",
+        warp_max_hops: int = 4,
     ) -> None:
         urls: list[str] = []
         for candidate in list(proxy_urls or []) + ([proxy_url] if proxy_url else []):
@@ -1279,6 +1288,33 @@ class AvitoClient:
         )
         self._proxy_discovery: ProxyDiscovery | None = None
         self._proxy_swap_lock = asyncio.Lock()
+        # WARP (как в openhop): браузер ходит через локальный SOCKS5 WARP,
+        # а при блокировке бот «прыгает» на новый IPv6 /64.
+        self._warp_module = warp_hop_lib
+        self._warp_hop = bool(warp_hop) and warp_hop_lib is not None
+        self._warp_primary = bool(warp_primary) and self._warp_hop
+        self._warp_proxy = (
+            warp_proxy or "socks5://127.0.0.1:40000"
+        ).strip()
+        self._warp_max_hops = max(1, int(warp_max_hops))
+        self._warp_hops_in_incident = 0
+        self._warp_active = False
+        self._warp_lock = asyncio.Lock()
+        explicit_proxy = bool(urls) or bool((browser_proxy or "").strip())
+        if (
+            self._warp_primary
+            and not explicit_proxy
+            and warp_hop_lib is not None
+            and warp_hop_lib.proxy_alive(self._warp_proxy)
+        ):
+            self._browser_proxy = self._warp_proxy
+            self._proxy_url = self._warp_proxy
+            self._warp_active = True
+            logger.info(
+                "Avito: браузер пойдёт через WARP (%s), при блокировке — "
+                "автоматическая смена IP",
+                mask_proxy(self._warp_proxy),
+            )
         if self._auto_proxy:
             try:
                 self._proxy_discovery = ProxyDiscovery(
@@ -1442,6 +1478,8 @@ class AvitoClient:
         """Проверяет кэш рабочих прокси и сразу включает лучшие из них."""
         if not self._auto_proxy or load_cached is None or validate_proxy is None:
             return
+        if self._warp_active:
+            return
         if not self.is_blocked():
             return
         try:
@@ -1541,6 +1579,7 @@ class AvitoClient:
         self._block_count = 0
         self._blocked_until = 0.0
         self._proxy_failures = 0
+        self._warp_hops_in_incident = 0
         if self._state_path is not None and self._state_path.exists():
             try:
                 self._state_path.unlink()
@@ -1876,14 +1915,14 @@ class AvitoClient:
     async def _on_browser_blocked(self, status: int) -> None:
         """Реакция на проверку IP: короткая пауза и автоматический обход."""
         self._note_soft_block()
+        if await self._try_warp_hop():
+            return
         rotated = False
         if self._rotate_on_block:
             rotated = bool(await self.rotate_browser_proxy())
         if rotated:
             # Прокси уже переключён — не ждём паузу, пробуем сразу.
-            self._blocked_until = 0.0
-            self._block_count = 0
-            self._save_state()
+            self._clear_block()
             return
         if self._auto_proxy:
             self._start_proxy_discovery()
@@ -1892,6 +1931,65 @@ class AvitoClient:
             "(при необходимости сам найду прокси)",
             max(1, self.blocked_seconds_left()),
         )
+
+    def _clear_block(self) -> None:
+        self._blocked_until = 0.0
+        self._block_count = 0
+        self._proxy_failures = 0
+        self._save_state()
+
+    async def _try_warp_hop(self) -> bool:
+        """Меняет выходной IP через WARP (механизм openhop).
+
+        Возвращает True, если браузер уже переключён/адрес сменён и пауза
+        снята — тогда можно сразу продолжать проверки.
+        """
+        module = self._warp_module
+        if not self._warp_hop or module is None:
+            return False
+        if not module.proxy_alive(self._warp_proxy):
+            restored = await asyncio.to_thread(
+                module.ensure_warp_proxy, self._warp_proxy, 20.0
+            )
+            if not restored:
+                if self._warp_active:
+                    await self._restart_browser_on_proxy(None)
+                    self._warp_active = False
+                    logger.warning(
+                        "Avito: WARP недоступен, временно работаю напрямую"
+                    )
+                    self._clear_block()
+                    return True
+                return False
+        async with self._warp_lock:
+            if self._browser_proxy != self._warp_proxy:
+                await self._restart_browser_on_proxy(self._warp_proxy)
+                self._warp_active = True
+                self._clear_block()
+                logger.warning(
+                    "Avito: переключаю браузер на WARP (%s)",
+                    mask_proxy(self._warp_proxy),
+                )
+                return True
+            if self._warp_hops_in_incident >= self._warp_max_hops:
+                logger.warning(
+                    "Avito: исчерпано %s смен IP через WARP, пробую прокси",
+                    self._warp_max_hops,
+                )
+                return False
+            ok, note = await asyncio.to_thread(
+                module.hop, self._warp_proxy, 90.0
+            )
+            self._warp_hops_in_incident += 1
+            if not ok:
+                logger.warning("Avito: не удалось сменить IP через WARP (%s)", note)
+                return False
+            # Прокси тот же, но тоннель новый: перезапускаем браузер,
+            # чтобы он не переиспользовал старые соединения (как в openhop).
+            await self._restart_browser_on_proxy(self._warp_proxy)
+            self._clear_block()
+            logger.warning("Avito: новый IP через WARP (%s)", note)
+            return True
 
     def _note_soft_block(self) -> None:
         """Короткая пауза при проверке IP: 30→60→120→300 секунд.

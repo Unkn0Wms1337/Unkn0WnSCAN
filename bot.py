@@ -471,6 +471,10 @@ async def run(config: Config) -> None:
         proxy_cache_path=str(config.avito_proxy_cache),
         proxy_scan_limit=config.avito_proxy_scan_limit,
         proxy_scan_workers=config.avito_proxy_scan_workers,
+        warp_hop=config.avito_warp_hop,
+        warp_primary=config.avito_warp_primary,
+        warp_proxy=config.avito_warp_proxy,
+        warp_max_hops=config.avito_warp_max_hops,
     )
     client = build_telegram_client(config)
     monitor: Monitor | None = None

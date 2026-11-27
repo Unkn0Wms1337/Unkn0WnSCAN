@@ -113,6 +113,10 @@ class Config:
     avito_proxy_cache: Path
     avito_proxy_scan_limit: int
     avito_proxy_scan_workers: int
+    avito_warp_hop: bool
+    avito_warp_primary: bool
+    avito_warp_proxy: str
+    avito_warp_max_hops: int
     avito_use_browser: bool
     avito_browser_headless: bool
     avito_browser_profile: Path
@@ -201,6 +205,13 @@ def load_config() -> Config:
         ),
         avito_proxy_scan_limit=_env_int("AVITO_PROXY_SCAN_LIMIT", 450, 50),
         avito_proxy_scan_workers=_env_int("AVITO_PROXY_SCAN_WORKERS", 100, 10),
+        avito_warp_hop=_env_bool("AVITO_WARP_HOP", True),
+        avito_warp_primary=_env_bool("AVITO_WARP_PRIMARY", True),
+        avito_warp_proxy=os.getenv(
+            "AVITO_WARP_PROXY", "socks5://127.0.0.1:40000"
+        ).strip()
+        or "socks5://127.0.0.1:40000",
+        avito_warp_max_hops=_env_int("AVITO_WARP_MAX_HOPS", 4, 1),
         avito_use_browser=_env_bool("AVITO_USE_BROWSER", True),
         avito_browser_headless=_env_bool("AVITO_BROWSER_HEADLESS", False),
         avito_browser_profile=_path_from_env(
