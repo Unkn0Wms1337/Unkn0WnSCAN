@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+# Первый запуск на новом ПК: bootstrap создаёт .venv, ставит зависимости,
+# скачивает Chromium и просит BOT_TOKEN. После этого запускает bot.py внутри
+# .venv. При обычном запуске это ничего не делает.
+from bootstrap import ensure_environment
+
+ensure_environment()
+
 import asyncio
 import contextlib
 import logging
@@ -9,6 +16,7 @@ from datetime import datetime
 from html import escape
 
 from telethon import TelegramClient, events
+from telethon.errors import AuthKeyDuplicatedError
 from telethon.network import ConnectionTcpMTProxyRandomizedIntermediate
 from telethon.tl import functions, types
 from telethon.tl.custom import Button
@@ -475,6 +483,8 @@ async def run(config: Config) -> None:
         warp_primary=config.avito_warp_primary,
         warp_proxy=config.avito_warp_proxy,
         warp_max_hops=config.avito_warp_max_hops,
+        warp_engine=config.avito_warp_engine,
+        usque_path=config.avito_usque_path,
     )
     client = build_telegram_client(config)
     monitor: Monitor | None = None
@@ -599,6 +609,15 @@ def main() -> None:
             asyncio.run(run(config))
         except (KeyboardInterrupt, SystemExit):
             break
+        except AuthKeyDuplicatedError:
+            logger.error(
+                "Telegram отозвал ключ сессии (сессию использовали с двух IP). "
+                "Удаляю data/bot.session и авторизуюсь заново."
+            )
+            for suffix in ("", "-journal"):
+                Path(str(config.session_path) + suffix).unlink(missing_ok=True)
+            time.sleep(3)
+            continue
         except Exception:
             logger.exception("Бот остановился с ошибкой, перезапуск через 30 сек.")
             time.sleep(30)

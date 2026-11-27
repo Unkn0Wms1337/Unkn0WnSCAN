@@ -117,6 +117,8 @@ class Config:
     avito_warp_primary: bool
     avito_warp_proxy: str
     avito_warp_max_hops: int
+    avito_warp_engine: str
+    avito_usque_path: str | None
     avito_use_browser: bool
     avito_browser_headless: bool
     avito_browser_profile: Path
@@ -212,6 +214,10 @@ def load_config() -> Config:
         ).strip()
         or "socks5://127.0.0.1:40000",
         avito_warp_max_hops=_env_int("AVITO_WARP_MAX_HOPS", 4, 1),
+        avito_warp_engine=(
+            os.getenv("AVITO_WARP_ENGINE", "auto").strip().lower() or "auto"
+        ),
+        avito_usque_path=os.getenv("AVITO_USQUE_PATH", "").strip() or None,
         avito_use_browser=_env_bool("AVITO_USE_BROWSER", True),
         avito_browser_headless=_env_bool("AVITO_BROWSER_HEADLESS", False),
         avito_browser_profile=_path_from_env(

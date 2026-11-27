@@ -73,47 +73,22 @@ Telegram через Tor работает, но Avito обычно блокиру
 
 ## Быстрый старт (Windows)
 
-1. Создайте бота у [@BotFather](https://t.me/BotFather) и получите токен.
-2. Установите зависимости:
+1. Установите [Python 3.10+](https://python.org) (при установке отметьте
+   «Add python.exe to PATH»).
+2. Скопируйте проект на новый ПК.
+3. Запустите `run.bat` (или `python bot.py`). Всё остальное бот сделает сам:
 
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
+- создаст `.venv` и установит зависимости из `requirements.txt`;
+- скачает Chromium для Playwright;
+- создаст `.env` и попросит `BOT_TOKEN` от [@BotFather](https://t.me/BotFather);
+- скачает встроенный WARP-клиент `usque` (~5 МБ) в `data/warp` для обхода
+  блокировок Авито;
+- запустит бота.
 
-3. Создайте `.env`:
+Повторные запуски сразу идут в готовое окружение — просто `python bot.py`.
 
-```powershell
-Copy-Item .env.example .env
-notepad .env
-```
-
-Заполните:
-
-```env
-BOT_TOKEN=...
-TELEGRAM_API_ID=2040
-TELEGRAM_API_HASH=b18441a1ff607e10a989891a5462e627
-
-TELEGRAM_MT_PROXY_SERVER=127.0.0.1
-TELEGRAM_MT_PROXY_PORT=1443
-TELEGRAM_MT_PROXY_SECRET=dd...
-```
-
-4. Убедитесь, что локальный MTProto-прокси запущен (порт `1443` слушается).
-5. Запустите бота в отдельном окне консоли — просто откройте `run.bat`
-   (или выполните `python bot.py`):
-
-```powershell
-.\run.bat
-```
-
-`run.bat` запускает бота в режиме обычной консоли: все логи видны в окне CMD,
-браузер работает без окон (headless). Если нужно остановить — закройте окно
-или нажмите `Ctrl+C`.
-
-6. Напишите боту `/start` и пришлите ссылку на поиск Авито.
+Если Telegram не подключается напрямую, впишите в `.env` свой MTProto/SOCKS5
+прокси (`TELEGRAM_MT_PROXY` или `TELEGRAM_PROXY_URL`) и запустите снова.
 
 По умолчанию бот ищет **по всей России** (`AVITO_ALL_RUSSIA=true`): город из
 ссылки отбрасывается, а в выдаче видны объявления из всех регионов. Чтобы
@@ -214,19 +189,21 @@ AVITO_PROXY_CACHE=data/proxies_working.txt
 
 ### Обход в стиле openhop (Cloudflare WARP)
 
-Основной способ — как в [openhop](https://openhop.cfd): браузер ходит в Авито через локальный SOCKS5 Cloudflare WARP (`127.0.0.1:40000`), а при блокировке бот сам получает новый адрес. Механизм тот же: `warp-cli tunnel rotate-keys`, сброс endpoint, переподключение — Cloudflare выдаёт новый IPv6 `/64`, после чего браузер перезапускается и продолжает работу.
+Основной способ — как в [openhop](https://openhop.cfd): браузер ходит в Авито через Cloudflare WARP, а при блокировке бот сам получает новый адрес. Механизм: смена ключей/регистрация устройства, сброс endpoint и переподключение — Cloudflare выдаёт новый IPv6 `/64`, после чего браузер перезапускается и продолжает работу.
 
-Нужен установленный [Cloudflare WARP](https://one.one.one.one/) в режиме локального прокси на порту 40000. Если у вас установлен openhop, он уже настраивает WARP именно так.
+**Ничего устанавливать вручную не нужно.** Бот сначала ищет официальный [Cloudflare WARP](https://one.one.one.one/) (`warp-cli`) в режиме локального прокси на порту 40000. Если его нет (обычный новый ПК), бот один раз скачивает встроенный WARP-клиент `usque` в `data/warp`, регистрирует устройство и поднимает свой SOCKS5 на `127.0.0.1:25344`. Прав администратора не требуется.
 
 ```env
 AVITO_WARP_HOP=true          # менять IP автоматически при блокировке
 AVITO_WARP_PRIMARY=true      # использовать WARP как основной прокси Авито
+AVITO_WARP_ENGINE=auto       # auto | official | usque
 AVITO_WARP_PROXY=socks5://127.0.0.1:40000
 AVITO_WARP_MAX_HOPS=4        # смен IP за одну блокировку
+# AVITO_USQUE_PATH=data/warp/usque.exe
 # WARP_CLI=C:\Program Files\Cloudflare\Cloudflare WARP\warp-cli.exe
 ```
 
-Порядок обхода при блокировке: смена IP через WARP (до `AVITO_WARP_MAX_HOPS` раз) → прокси из `AVITO_PROXY_URLS` (если заданы) → автоматический поиск публичных прокси → короткая пауза и повтор. Всё без участия человека. Если WARP не установлен или выключен, бот просто работает напрямую, как раньше.
+Порядок обхода при блокировке: смена IP через WARP (до `AVITO_WARP_MAX_HOPS` раз) → прокси из `AVITO_PROXY_URLS` (если заданы) → автоматический поиск публичных прокси → короткая пауза и повтор. Всё без участия человека. Если WARP недоступен, бот работает напрямую и повторяет попытку при следующей блокировке.
 
 Запускайте только **один** экземпляр бота: при старте создаётся `data/bot.lock`, второй экземпляр сразу завершится. Иначе Telegram отзывает ключ сессии (`AuthKeyDuplicatedError`).
 
@@ -293,8 +270,10 @@ MTProto-прокси из `tg://...` помогает только Telegram, н�
 | `AVITO_AUTO_PROXY` | `true` | Самому находить и проверять рабочие прокси при блокировке IP |
 | `AVITO_WARP_HOP` | `true` | Менять IP через Cloudflare WARP при блокировке (как openhop) |
 | `AVITO_WARP_PRIMARY` | `true` | Использовать WARP как основной прокси для Авито |
-| `AVITO_WARP_PROXY` | `socks5://127.0.0.1:40000` | Локальный SOCKS5 WARP |
+| `AVITO_WARP_ENGINE` | `auto` | `auto` / `official` / `usque` |
+| `AVITO_WARP_PROXY` | `socks5://127.0.0.1:40000` | Локальный SOCKS5 официального WARP |
 | `AVITO_WARP_MAX_HOPS` | `4` | Смен IP через WARP за одну блокировку |
+| `AVITO_USQUE_PATH` | `data/warp/usque.exe` | Встроенный WARP-клиент (скачивается сам) |
 | `AVITO_PROXY_SCAN_LIMIT` | `450` | Сколько прокси проверять за один автопоиск |
 | `AVITO_PROXY_SCAN_WORKERS` | `100` | Потоков проверки прокси |
 | `AVITO_PROXY_CACHE` | `data/proxies_working.txt` | Кэш найденных рабочих прокси |
@@ -319,8 +298,10 @@ docker compose logs -f
 
 - `avito.py` — загрузка страницы, извлечение карточек из отрендеренного DOM (и JSON-фолбэк), чтение времени публикации и данных продавца.
 - `avito_browser.py` — один Chromium и одна переиспользуемая страница; картинки, шрифты и медиа не скачиваются, чтобы не нагружать систему.
+- `bootstrap.py` — первичная настройка: `.venv`, зависимости, Chromium, `.env`, BOT_TOKEN.
 - `proxy_pool.py` — автоматический поиск и проверка прокси при блокировке IP, кэш рабочих адресов.
-- `warp_hop.py` — смена выходного IP через Cloudflare WARP (`warp-cli`), подход openhop.
+- `warp_hop.py` — смена выходного IP через Cloudflare WARP: официальный `warp-cli` или встроенный `usque`.
+- `vendor/usque.zip` — встроенный WARP-клиент для новых ПК (распаковывается в `data/warp`).
 - `monitor.py` — цикл проверки, фильтр свежести, отправка только unseen-объявлений, пропуск заблокированных продавцов.
 - `formatter.py` — подпись к фото: название, цена, продавец, рейтинг, описание в цитате.
 - `notifier.py` — скачивание и конвертация фото (WebP → JPEG), отправка через Telethon одним сообщением с кнопками и немедленная очистка.

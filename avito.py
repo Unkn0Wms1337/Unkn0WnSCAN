@@ -1250,6 +1250,8 @@ class AvitoClient:
         warp_primary: bool = False,
         warp_proxy: str = "socks5://127.0.0.1:40000",
         warp_max_hops: int = 4,
+        warp_engine: str = "auto",
+        usque_path: str | None = None,
     ) -> None:
         urls: list[str] = []
         for candidate in list(proxy_urls or []) + ([proxy_url] if proxy_url else []):
@@ -1297,24 +1299,38 @@ class AvitoClient:
             warp_proxy or "socks5://127.0.0.1:40000"
         ).strip()
         self._warp_max_hops = max(1, int(warp_max_hops))
+        self._warp_engine = (warp_engine or "auto").strip().lower()
+        self._usque_path = (usque_path or "").strip() or None
         self._warp_hops_in_incident = 0
         self._warp_active = False
         self._warp_lock = asyncio.Lock()
         explicit_proxy = bool(urls) or bool((browser_proxy or "").strip())
-        if (
-            self._warp_primary
-            and not explicit_proxy
-            and warp_hop_lib is not None
-            and warp_hop_lib.proxy_alive(self._warp_proxy)
-        ):
-            self._browser_proxy = self._warp_proxy
-            self._proxy_url = self._warp_proxy
-            self._warp_active = True
-            logger.info(
-                "Avito: браузер пойдёт через WARP (%s), при блокировке — "
-                "автоматическая смена IP",
-                mask_proxy(self._warp_proxy),
+        if self._warp_primary and not explicit_proxy and warp_hop_lib is not None:
+            # На новом ПК официального Cloudflare WARP может не быть —
+            # warp_hop сам скачает встроенный клиент usque и поднимет SOCKS5.
+            logger.info("Avito: готовлю WARP (движок %s)…", self._warp_engine)
+            chosen = warp_hop_lib.ensure_ready(
+                prefer=self._warp_engine,
+                official_proxy=self._warp_proxy,
+                usque_path=self._usque_path,
+                timeout=150.0,
             )
+            if chosen:
+                self._warp_proxy = chosen
+                self._browser_proxy = chosen
+                self._proxy_url = chosen
+                self._warp_active = True
+                logger.info(
+                    "Avito: браузер пойдёт через WARP (%s, движок %s), "
+                    "при блокировке — автоматическая смена IP",
+                    mask_proxy(chosen),
+                    warp_hop_lib.backend() or "?",
+                )
+            else:
+                logger.warning(
+                    "Avito: WARP не запустился, работаю напрямую. "
+                    "Бот сам повторит при первой блокировке."
+                )
         if self._auto_proxy:
             try:
                 self._proxy_discovery = ProxyDiscovery(
@@ -1949,7 +1965,11 @@ class AvitoClient:
             return False
         if not module.proxy_alive(self._warp_proxy):
             restored = await asyncio.to_thread(
-                module.ensure_warp_proxy, self._warp_proxy, 20.0
+                module.ensure_ready,
+                prefer=self._warp_engine,
+                official_proxy=self._warp_proxy,
+                usque_path=self._usque_path,
+                timeout=150.0,
             )
             if not restored:
                 if self._warp_active:
@@ -1961,6 +1981,7 @@ class AvitoClient:
                     self._clear_block()
                     return True
                 return False
+            self._warp_proxy = restored
         async with self._warp_lock:
             if self._browser_proxy != self._warp_proxy:
                 await self._restart_browser_on_proxy(self._warp_proxy)
