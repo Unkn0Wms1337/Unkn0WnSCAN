@@ -186,9 +186,12 @@ BLOCKED_RESOURCES = {"image", "media", "font"}
 
 
 class BrowserFetchError(Exception):
-    def __init__(self, message: str, status: int | None = None) -> None:
+    def __init__(
+        self, message: str, status: int | None = None, hard: bool = False
+    ) -> None:
         super().__init__(message)
         self.status = status
+        self.hard = hard
 
 
 class AvitoBrowser:
@@ -341,6 +344,24 @@ class AvitoBrowser:
         lowered = (body or "").casefold()
         return any(marker in lowered for marker in BLOCK_MARKERS)
 
+    async def _is_hard_block(self, page, body: str) -> bool:
+        """Жёсткая страница «Доступ ограничен: проблема с IP».
+
+        Она не проходит сама даже после PoW и обычно означает, что Авито
+        запомнил этот профиль браузера. Лечится чистым профилем.
+        """
+        text = (body or "").casefold()
+        try:
+            title = ((await page.title()) or "").casefold()
+        except Exception:  # noqa: BLE001
+            title = ""
+        haystack = title + "\n" + text
+        return (
+            "доступ ограничен" in haystack
+            or "проблема с ip" in haystack
+            or "проблем с ip" in haystack
+        )
+
     async def _try_pass_challenge(self, page) -> bool:
         """Даёт антибот-проверке пройти самой, без участия человека.
 
@@ -359,7 +380,7 @@ class AvitoBrowser:
         """Автоматически перезагружает страницу, пока PoW не пропустит."""
         items: list[dict] = []
         for attempt in range(max(1, attempts)):
-            await asyncio.sleep(12.0 + 6.0 * attempt)
+            await asyncio.sleep(2.0 + 2.0 * attempt)
             try:
                 await page.goto(
                     url, wait_until="domcontentloaded", timeout=self._timeout_ms
@@ -413,20 +434,40 @@ class AvitoBrowser:
 
                 body = "" if (on_target and items) else await self._body_text(page)
                 on_challenge = on_captcha_page or self._is_challenge(body)
+                hard_block = on_challenge and await self._is_hard_block(page, body)
 
                 # Проверка IP на главной/чужой странице не значит, что закрыта
                 # выдача: Авито часто пускает на конкретный поиск. Поэтому
                 # сначала пробуем открыть целевой URL, и только если капча уже
                 # на нём — ждём ручного прохождения.
                 if on_target and not force and not items and on_challenge:
+                    if hard_block:
+                        # Ждать бесполезно: это флаг профиля/IP, а не PoW.
+                        raise BrowserFetchError(
+                            "Avito: доступ ограничен (проблема с IP)",
+                            status=429,
+                            hard=True,
+                        )
                     # Лёгкая проверка («проверка безопасности») проходит сама
-                    # за несколько секунд; если нет — перезагружаем страницу
-                    # и даём PoW отработать заново, без участия человека.
+                    # за несколько секунд. Долго ждать нельзя: пока PoW висит,
+                    # IP уже можно сменить и продолжить почти сразу.
                     logger.info("Avito: проверка безопасности, жду прохождения")
-                    items = await self._wait_items(page, 12000)
+                    items = await self._wait_items(page, 2000)
                     if items:
                         return items
-                    items = await self._auto_recover(page, url, attempts=2)
+                    # Одна быстрая перезагрузка: если это была разовая
+                    # проверка, она пройдёт; если IP закрыт — отдаём 429,
+                    # чтобы AvitoClient мгновенно сменил IP через WARP.
+                    try:
+                        await page.goto(
+                            url,
+                            wait_until="domcontentloaded",
+                            timeout=self._timeout_ms,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    await self._try_pass_challenge(page)
+                    items = await self._wait_items(page, 3000)
                     if items:
                         return items
                     raise BrowserFetchError(
@@ -452,6 +493,20 @@ class AvitoBrowser:
                             f"Avito вернул HTTP {response.status}",
                             status=response.status,
                         )
+                    if response is not None and response.status in {403, 429, 439}:
+                        # Жёсткая страница «проблема с IP» не лечится ожиданием:
+                        # сразу сообщаем клиенту, чтобы он сменил IP/профиль.
+                        for _ in range(5):
+                            blocked_body = await self._body_text(page)
+                            if self._is_challenge(blocked_body):
+                                if await self._is_hard_block(page, blocked_body):
+                                    raise BrowserFetchError(
+                                        "Avito: доступ ограничен (проблема с IP)",
+                                        status=429,
+                                        hard=True,
+                                    )
+                                break
+                            await asyncio.sleep(0.25)
                     await self._try_pass_challenge(page)
                     items = await self._wait_items(page, 25000)
                     if items:
@@ -476,12 +531,15 @@ class AvitoBrowser:
                     return items
                 body = await self._body_text(page)
                 if self._is_challenge(body):
-                    # Последний шанс: иногда PoW отвечает чуть позже, а иногда
-                    # помогает только повторная загрузка целевого URL.
-                    items = await self._wait_items(page, 10000)
-                    if items:
-                        return items
-                    items = await self._auto_recover(page, url, attempts=2)
+                    hard = await self._is_hard_block(page, body)
+                    if hard:
+                        raise BrowserFetchError(
+                            "Avito: доступ ограничен (проблема с IP)",
+                            status=429,
+                            hard=True,
+                        )
+                    # Последний шанс: PoW иногда отвечает на пару секунд позже.
+                    items = await self._wait_items(page, 2500)
                     if items:
                         return items
                     raise BrowserFetchError(

@@ -9,6 +9,7 @@ import json
 import logging
 import random
 import re
+import shutil
 import statistics
 import time
 import zlib
@@ -1346,6 +1347,7 @@ class AvitoClient:
             "profile_dir": browser_profile,
             "timeout_ms": int(self._timeout * 1000),
         }
+        self._last_profile_reset = 0.0
         self._state_path = Path(state_path) if state_path else None
         self._load_state()
         self._sessions: dict[str | None, AsyncSession] = {}
@@ -1423,6 +1425,51 @@ class AvitoClient:
                 logger.debug("Avito: ошибка закрытия браузера", exc_info=True)
             self._browser = self._make_browser()
         self._force_reload = True
+
+    async def _reset_browser_profile(self) -> None:
+        """Создаёт чистый профиль, если Авито заблокировал текущий.
+
+        Жёсткая страница «проблема с IP» остаётся даже после смены IP и PoW:
+        она привязана к кукам/хранилищу профиля. Новый профиль стартует
+        с чистого листа и сразу проходит.
+        """
+        if AvitoBrowser is None or self._browser is None:
+            return
+        profile = str(self._browser_opts.get("profile_dir") or "").strip()
+        if not profile:
+            return
+        now = time.time()
+        if now - self._last_profile_reset < 600:
+            logger.warning(
+                "Avito: профиль уже сбрасывался недавно, повторю позже"
+            )
+            return
+        self._last_profile_reset = now
+        path = Path(profile)
+        logger.warning("Avito: профиль браузера заблокирован — создаю чистый")
+        try:
+            await self._browser.close()
+        except Exception:  # noqa: BLE001
+            logger.debug("Avito: ошибка закрытия браузера", exc_info=True)
+        backup: Path | None = None
+        try:
+            if path.exists():
+                backup = path.with_name(f"{path.name}.blocked-{int(now)}")
+                path.rename(backup)
+        except Exception:  # noqa: BLE001
+            shutil.rmtree(path, ignore_errors=True)
+        self._browser = self._make_browser()
+        try:
+            await self._browser.start()
+        except Exception:  # noqa: BLE001
+            logger.debug("Avito: не удалось сразу открыть чистый профиль", exc_info=True)
+        if backup is not None:
+            # Удаление 400+ МБ не должно задерживать возврат к мониторингу.
+            asyncio.get_running_loop().run_in_executor(
+                None, shutil.rmtree, backup, True
+            )
+        self._force_reload = True
+        self._last_request_at = 0.0
 
     async def rotate_browser_proxy(self) -> str | None:
         """Перезапускает браузер на следующем прокси из списка.
@@ -1928,10 +1975,19 @@ class AvitoClient:
                 break
         return collected
 
-    async def _on_browser_blocked(self, status: int) -> None:
-        """Реакция на проверку IP: короткая пауза и автоматический обход."""
-        self._note_soft_block()
-        if await self._try_warp_hop():
+    async def _on_browser_blocked(self, status: int, hard: bool = False) -> None:
+        """Реакция на проверку IP: мгновенно меняем IP и продолжаем."""
+        # Сначала пробуем сменить IP — паузу ставим только если ничего не помогло.
+        hopped = await self._try_warp_hop()
+        if hard:
+            # «Доступ ограничен: проблема с IP» не проходит после PoW —
+            # Авито запомнил профиль. Чистый профиль решает за один шаг.
+            await self._reset_browser_profile()
+            self._clear_block()
+            self._force_reload = True
+            self._last_request_at = 0.0
+            return
+        if hopped:
             return
         rotated = False
         if self._rotate_on_block:
@@ -1942,6 +1998,8 @@ class AvitoClient:
             return
         if self._auto_proxy:
             self._start_proxy_discovery()
+        # Ничего не помогло — ставим короткую паузу.
+        self._note_soft_block()
         logger.warning(
             "Avito: проверка IP. Повторю автоматически через %s сек. "
             "(при необходимости сам найду прокси)",
@@ -2005,21 +2063,26 @@ class AvitoClient:
             if not ok:
                 logger.warning("Avito: не удалось сменить IP через WARP (%s)", note)
                 return False
-            # Прокси тот же, но тоннель новый: перезапускаем браузер,
-            # чтобы он не переиспользовал старые соединения (как в openhop).
-            await self._restart_browser_on_proxy(self._warp_proxy)
+            if module.needs_browser_restart(self._warp_proxy):
+                # Прокси/порт сменился — браузер нужно перезапустить.
+                await self._restart_browser_on_proxy(self._warp_proxy)
+            else:
+                # Пул WARP: фасад остался тем же, IP уже новый. Достаточно
+                # сразу перезагрузить страницу — без перезапуска Chromium.
+                self._force_reload = True
+                self._last_request_at = 0.0
             self._clear_block()
             logger.warning("Avito: новый IP через WARP (%s)", note)
             return True
 
     def _note_soft_block(self) -> None:
-        """Короткая пауза при проверке IP: 30→60→120→300 секунд.
+        """Минимальная пауза при проверке IP: 3→6→12→30 секунд.
 
-        В отличие от жёсткой блокировки (10→20→40… минут) такая пауза
-        позволяет быстро вернуться, как только PoW/прокси сработают.
+        Даём Авито чуть-чуть остыть, но не теряем время: WARP hop или
+        ротация прокси уже произошли, нужна лишь крошечная задержка.
         """
         self._block_count += 1
-        seconds = min(300, 30 * (2 ** (self._block_count - 1)))
+        seconds = min(30, 3 * (2 ** (self._block_count - 1)))
         self._blocked_until = time.time() + seconds
         self._save_state()
 
@@ -2051,7 +2114,9 @@ class AvitoClient:
                     )
                 except BrowserFetchError as exc:
                     if exc.status in {403, 429, 439}:
-                        await self._on_browser_blocked(exc.status)
+                        await self._on_browser_blocked(
+                            exc.status, getattr(exc, "hard", False)
+                        )
                         raise AvitoBlockedError(
                             "Авито проверяет IP. Бот обходит проверку "
                             "автоматически и продолжит сам.",
@@ -2070,7 +2135,9 @@ class AvitoClient:
                     raw_items = await self._browser.fetch_search_items(page_url)
                 except BrowserFetchError as exc:
                     if exc.status in {403, 429, 439}:
-                        await self._on_browser_blocked(exc.status)
+                        await self._on_browser_blocked(
+                            exc.status, getattr(exc, "hard", False)
+                        )
                         raise AvitoBlockedError(
                             "Авито проверяет IP. Бот обходит проверку "
                             "автоматически и продолжит сам.",

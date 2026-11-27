@@ -28,6 +28,8 @@ from storage import Storage, Subscription
 logger = logging.getLogger(__name__)
 
 FORBIDDEN_ERRORS = (ForbiddenError, UserIsBlockedError, InputUserDeactivatedError)
+BLOCK_RETRIES = 3
+BLOCK_RETRY_DELAY = 1.5
 
 
 class Monitor:
@@ -125,7 +127,9 @@ class Monitor:
             )
             return
         try:
-            listings = await self.avito.fetch_search(subscription.url, self.initial_pages)
+            listings = await self._fetch_search_resilient(
+                subscription.url, self.initial_pages
+            )
         except Exception as exc:
             logger.warning("Первичная проверка %s не удалась: %s", subscription.url, exc)
             self.storage.set_error(subscription.id, self._error_text(exc))
@@ -182,7 +186,9 @@ class Monitor:
             )
             return
         try:
-            listings = await self.avito.fetch_search(subscription.url, self.check_pages)
+            listings = await self._fetch_search_resilient(
+                subscription.url, self.check_pages
+            )
         except Exception as exc:
             message = self._error_text(exc)
             should_notify = self.storage.set_error(subscription.id, message)
@@ -350,9 +356,25 @@ class Monitor:
                 len(accepted),
             )
 
+    async def _fetch_search_resilient(self, url: str, pages: int) -> list[Listing]:
+        """Retry the search after the Avito client automatically changes IP."""
+        for attempt in range(BLOCK_RETRIES):
+            try:
+                return await self.avito.fetch_search(url, pages)
+            except AvitoBlockedError:
+                if attempt + 1 >= BLOCK_RETRIES:
+                    raise
+                await asyncio.sleep(BLOCK_RETRY_DELAY)
+                logger.info(
+                    "Повторяю проверку Avito после смены IP (%s/%s)",
+                    attempt + 2,
+                    BLOCK_RETRIES,
+                )
+        return []
+
     async def search_now(self, chat_id: int, url: str, limit: int = 8) -> int:
         """Run a one-off search and send the freshest listings to the chat."""
-        listings = await self.avito.fetch_search(url, 1)
+        listings = await self._fetch_search_resilient(url, 1)
         if not listings:
             await self._send_text(
                 chat_id, "🔎 По этому запросу сейчас ничего не нашлось."

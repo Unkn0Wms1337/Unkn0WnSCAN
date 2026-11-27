@@ -538,6 +538,12 @@ async def run(config: Config) -> None:
             with contextlib.suppress(asyncio.CancelledError):
                 await monitor_task
         await avito_client.close()
+        try:
+            import warp_hop
+
+            warp_hop.shutdown()
+        except Exception:  # noqa: BLE001
+            logger.debug("Не удалось остановить WARP", exc_info=True)
         storage.close()
         await client.disconnect()
 
