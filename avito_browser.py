@@ -339,6 +339,46 @@ class AvitoBrowser:
         except Exception:
             return ""
 
+    async def _dismiss_age_gate(self, page) -> bool:
+        """Подтверждает возраст только на явно распознанном экране 18+."""
+        try:
+            clicked = await page.evaluate(
+                """() => {
+                    const normalize = (value) => (value || '')
+                        .replace(/\\s+/g, ' ').trim().toLocaleLowerCase('ru');
+                    const body = normalize(document.body ? document.body.innerText : '');
+                    if (!/(вам\\s+есть\\s+18\\s+лет|вам\\s+исполнилось\\s+18)/i.test(body)) {
+                        return false;
+                    }
+                    const accepted = new Set([
+                        'да, есть',
+                        'да, мне есть 18 лет',
+                        'мне есть 18 лет',
+                        'да, мне исполнилось 18 лет',
+                    ]);
+                    for (const control of document.querySelectorAll(
+                        'button, a, [role="button"]'
+                    )) {
+                        const text = normalize(control.innerText || control.textContent);
+                        const rect = control.getBoundingClientRect();
+                        const style = getComputedStyle(control);
+                        const visible = rect.width > 0 && rect.height > 0
+                            && style.visibility !== 'hidden' && style.display !== 'none';
+                        if (visible && accepted.has(text)) {
+                            control.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }"""
+            )
+            if clicked:
+                logger.info("Avito: автоматически подтверждён возрастной экран 18+")
+            return bool(clicked)
+        except Exception:  # noqa: BLE001
+            logger.debug("Avito: не удалось проверить возрастное окно", exc_info=True)
+            return False
+
     @staticmethod
     def _is_challenge(body: str) -> bool:
         lowered = (body or "").casefold()
@@ -398,6 +438,7 @@ class AvitoBrowser:
 
     async def _wait_items(self, page, timeout_ms: int) -> list[dict]:
         """Ждёт карточки, давая антибот-проверке время пройти самой."""
+        await self._dismiss_age_gate(page)
         try:
             await page.wait_for_selector(SEARCH_ITEM_SELECTOR, timeout=timeout_ms)
         except Exception:
@@ -573,6 +614,7 @@ class AvitoBrowser:
                 status = response.status
                 if status >= 400 and status not in {403, 429, 439}:
                     raise BrowserFetchError(f"Avito вернул HTTP {status}", status=status)
+                await self._dismiss_age_gate(page)
                 try:
                     await page.wait_for_selector(SEARCH_ITEM_SELECTOR, timeout=wait_ms)
                 except Exception:
