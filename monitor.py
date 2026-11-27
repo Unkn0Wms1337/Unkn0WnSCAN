@@ -416,9 +416,12 @@ class Monitor:
         logger.info("Мониторинг запущен, интервал %s сек.", self.interval)
         while not self._stop.is_set():
             subscriptions = self.storage.list_subscriptions()
-            for subscription in subscriptions:
-                if self._stop.is_set():
-                    break
+            # Не проверяем подписки последовательно: медленный поиск или
+            # отправка нескольких объявлений в одном чате не должен отодвигать
+            # такой же поиск в другом чате. Все подписки текущего раунда
+            # стартуют одновременно, а внутренние блокировки защищают только
+            # конкретную подписку.
+            async def check_one(subscription: Subscription) -> None:
                 try:
                     if subscription.initialized:
                         await self.check_subscription(subscription.id)
@@ -428,6 +431,9 @@ class Monitor:
                     raise
                 except Exception:
                     logger.exception("Ошибка при проверке подписки #%s", subscription.id)
+
+            if subscriptions:
+                await asyncio.gather(*(check_one(item) for item in subscriptions))
             try:
                 # Небольшой разброс, чтобы запросы не шли строго по секундомеру.
                 jitter = random.uniform(0, min(12.0, max(0.4, self.interval * 0.2)))
