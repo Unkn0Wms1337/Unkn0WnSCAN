@@ -29,6 +29,17 @@ except Exception:  # pragma: no cover
     def mask_proxy(url: str | None) -> str:  # type: ignore[misc]
         return "нет"
 
+try:
+    from proxy_pool import (
+        ProxyDiscovery,
+        load_cached,
+        save_cached,
+        validate_proxy,
+    )
+except Exception:  # pragma: no cover
+    ProxyDiscovery = None  # type: ignore[assignment]
+    load_cached = save_cached = validate_proxy = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 AVITO_HOSTS = ("avito.ru", "www.avito.ru", "m.avito.ru")
@@ -1226,6 +1237,10 @@ class AvitoClient:
         browser_proxy: str | None = None,
         rotate_on_block: bool = True,
         block_pause_minutes: int = 10,
+        auto_proxy: bool = True,
+        proxy_cache_path: str | None = None,
+        proxy_scan_limit: int = 450,
+        proxy_scan_workers: int = 100,
     ) -> None:
         urls: list[str] = []
         for candidate in list(proxy_urls or []) + ([proxy_url] if proxy_url else []):
@@ -1251,8 +1266,29 @@ class AvitoClient:
         # Прокси для браузера: отдельный, иначе первый из общего списка.
         browser_proxy = (browser_proxy or "").strip() or self._proxy_url
         self._browser_proxy = browser_proxy
-        self._rotate_on_block = bool(rotate_on_block) and bool(urls)
+        self._rotate_enabled = bool(rotate_on_block)
+        self._rotate_on_block = self._rotate_enabled and bool(self._proxy_urls)
+        self._proxy_failures = 0
+        self._rotate_cooldown = 5.0
         self._block_pause_minutes = max(1, int(block_pause_minutes))
+        # Автопоиск прокси: если Авито закрыл IP, бот сам находит рабочие
+        # прокси в фоне и перезапускает на них браузер, без участия человека.
+        self._auto_proxy = bool(auto_proxy)
+        self._proxy_cache_path = (
+            proxy_cache_path or str(Path("data") / "proxies_working.txt")
+        )
+        self._proxy_discovery: ProxyDiscovery | None = None
+        self._proxy_swap_lock = asyncio.Lock()
+        if self._auto_proxy:
+            try:
+                self._proxy_discovery = ProxyDiscovery(
+                    cache_path=self._proxy_cache_path,
+                    limit=proxy_scan_limit,
+                    workers=proxy_scan_workers,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("Avito: автопоиск прокси недоступен", exc_info=True)
+                self._proxy_discovery = None
         self._browser_opts: dict[str, Any] = {
             "headless": browser_headless,
             "profile_dir": browser_profile,
@@ -1303,15 +1339,29 @@ class AvitoClient:
         """Текущий прокси (для картинок и прочих запросов вне браузера)."""
         return self._proxy_url
 
-    async def rotate_browser_proxy(self) -> str | None:
-        """Перезапускает браузер на следующем прокси из списка.
+    def set_proxy_candidates(self, urls: Sequence[str]) -> None:
+        """Обновляет пул прокси (например, после автопоиска).
 
-        Возвращает новый прокси или None, если прокси не настроены.
+        Браузер переключится на новый прокси при следующей блокировке;
+        если он ещё не запущен — сразу стартует с первого из пула.
         """
-        if not self._proxy_urls or AvitoBrowser is None:
-            return None
-        self._proxy_index = (self._proxy_index + 1) % len(self._proxy_urls)
-        proxy = self._proxy_urls[self._proxy_index]
+        cleaned: list[str] = []
+        for candidate in urls or []:
+            value = (candidate or "").strip()
+            if value and value not in cleaned:
+                cleaned.append(value)
+        if cleaned == self._proxy_urls:
+            return
+        self._proxy_urls = cleaned
+        self._proxy_index = 0
+        self._proxy_url = cleaned[0] if cleaned else None
+        self._browser_proxy = self._proxy_url
+        self._rotate_on_block = self._rotate_enabled and bool(cleaned)
+        self._proxy_failures = 0
+        logger.info("Avito: пул прокси обновлён (%s шт.)", len(cleaned))
+
+    async def _restart_browser_on_proxy(self, proxy: str | None) -> None:
+        """Перезапускает браузер, чтобы он начал ходить через новый прокси."""
         self._proxy_url = proxy
         self._browser_proxy = proxy
         if self._browser is not None:
@@ -1320,12 +1370,108 @@ class AvitoClient:
             except Exception:  # noqa: BLE001
                 logger.debug("Avito: ошибка закрытия браузера", exc_info=True)
             self._browser = self._make_browser()
+        self._force_reload = True
+
+    async def rotate_browser_proxy(self) -> str | None:
+        """Перезапускает браузер на следующем прокси из списка.
+
+        Возвращает новый прокси или None, если прокси не настроены.
+        """
+        if not self._proxy_urls or AvitoBrowser is None:
+            return None
+        async with self._proxy_swap_lock:
+            self._proxy_index = (self._proxy_index + 1) % len(self._proxy_urls)
+            proxy = self._proxy_urls[self._proxy_index]
+            await self._restart_browser_on_proxy(proxy)
         logger.warning(
             "Avito: переключаю браузер на прокси #%s (%s)",
             self._proxy_index + 1,
             mask_proxy(proxy),
         )
         return proxy
+
+    async def _switch_to_best_proxy(self) -> None:
+        """Переключает браузер на первый прокси из свежего пула."""
+        async with self._proxy_swap_lock:
+            if not self._proxy_urls:
+                return
+            proxy = self._proxy_urls[0]
+            self._proxy_index = 0
+            await self._restart_browser_on_proxy(proxy)
+        # Новый прокси прошёл проверку — снимаем паузу и пробуем сразу.
+        self._blocked_until = 0.0
+        self._block_count = 0
+        self._proxy_failures = 0
+        self._save_state()
+        logger.warning("Avito: перешёл на рабочий прокси %s", mask_proxy(proxy))
+
+    def _adopt_proxies(self, proxies: Sequence[str]) -> None:
+        """Применяет найденные прокси (вызывается из потока-обнаружителя)."""
+        cleaned = [p for p in proxies if p]
+        if not cleaned:
+            return
+        self.set_proxy_candidates(cleaned)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._switch_to_best_proxy())
+
+    def _start_proxy_discovery(self) -> None:
+        """Запускает фоновый поиск прокси, если он ещё не идёт."""
+        discovery = self._proxy_discovery
+        if discovery is None or not discovery.ready():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        def on_done(found: Sequence[str]) -> None:
+            if found:
+                loop.call_soon_threadsafe(self._adopt_proxies, list(found))
+            else:
+                logger.warning(
+                    "Avito: рабочих прокси не нашлось, продолжу с текущего IP"
+                )
+
+        if discovery.start(on_done=on_done):
+            logger.info("Avito: ищу рабочие прокси в фоне (автообход блокировки)")
+
+    async def preload_cached_proxies(self) -> None:
+        """Проверяет кэш рабочих прокси и сразу включает лучшие из них."""
+        if not self._auto_proxy or load_cached is None or validate_proxy is None:
+            return
+        if not self.is_blocked():
+            return
+        try:
+            cached = load_cached(self._proxy_cache_path)
+        except Exception:  # noqa: BLE001
+            return
+        if not cached:
+            return
+
+        try:
+            results = await asyncio.gather(
+                *(asyncio.to_thread(validate_proxy, proxy) for proxy in cached),
+                return_exceptions=True,
+            )
+        except Exception:  # noqa: BLE001
+            return
+        valid = [
+            proxy
+            for proxy, ok in zip(cached, results)
+            if ok is True
+        ]
+        if not valid:
+            return
+        if save_cached is not None:
+            save_cached(self._proxy_cache_path, valid)
+        self.set_proxy_candidates(valid)
+        logger.info(
+            "Avito: включил %s прокси из кэша (автообход блокировки)",
+            len(valid),
+        )
 
     def _session_kwargs(self, proxy: str | None) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
@@ -1394,6 +1540,7 @@ class AvitoClient:
     def _reset_block(self) -> None:
         self._block_count = 0
         self._blocked_until = 0.0
+        self._proxy_failures = 0
         if self._state_path is not None and self._state_path.exists():
             try:
                 self._state_path.unlink()
@@ -1727,18 +1874,35 @@ class AvitoClient:
         return collected
 
     async def _on_browser_blocked(self, status: int) -> None:
-        """Реакция на проверку IP/429: пауза и, если есть, смена прокси."""
-        self._note_block()
-        if self._rotate_on_block and await self.rotate_browser_proxy():
-            logger.warning(
-                "Avito: блокировка IP — браузер перезапускаю на следующем прокси"
-            )
-        else:
-            logger.warning(
-                "Avito: проверка IP. Пауза %s мин. Пройдите проверку в открытом "
-                "окне (или добавьте прокси в AVITO_PROXY_URLS).",
-                self._block_pause_minutes,
-            )
+        """Реакция на проверку IP: короткая пауза и автоматический обход."""
+        self._note_soft_block()
+        rotated = False
+        if self._rotate_on_block:
+            rotated = bool(await self.rotate_browser_proxy())
+        if rotated:
+            # Прокси уже переключён — не ждём паузу, пробуем сразу.
+            self._blocked_until = 0.0
+            self._block_count = 0
+            self._save_state()
+            return
+        if self._auto_proxy:
+            self._start_proxy_discovery()
+        logger.warning(
+            "Avito: проверка IP. Повторю автоматически через %s сек. "
+            "(при необходимости сам найду прокси)",
+            max(1, self.blocked_seconds_left()),
+        )
+
+    def _note_soft_block(self) -> None:
+        """Короткая пауза при проверке IP: 30→60→120→300 секунд.
+
+        В отличие от жёсткой блокировки (10→20→40… минут) такая пауза
+        позволяет быстро вернуться, как только PoW/прокси сработают.
+        """
+        self._block_count += 1
+        seconds = min(300, 30 * (2 ** (self._block_count - 1)))
+        self._blocked_until = time.time() + seconds
+        self._save_state()
 
     async def _fetch_search_browser(self, url: str, pages: int) -> list[Listing]:
         assert self._browser is not None
@@ -1770,8 +1934,8 @@ class AvitoClient:
                     if exc.status in {403, 429, 439}:
                         await self._on_browser_blocked(exc.status)
                         raise AvitoBlockedError(
-                            "Авито показывает проверку IP. Пройдите её в открытом "
-                            "браузере — бот продолжит автоматически.",
+                            "Авито проверяет IP. Бот обходит проверку "
+                            "автоматически и продолжит сам.",
                             status=exc.status,
                         ) from exc
                     raise AvitoError(
@@ -1789,8 +1953,8 @@ class AvitoClient:
                     if exc.status in {403, 429, 439}:
                         await self._on_browser_blocked(exc.status)
                         raise AvitoBlockedError(
-                            "Авито показывает проверку IP. Пройдите её в открытом "
-                            "браузере — бот продолжит автоматически.",
+                            "Авито проверяет IP. Бот обходит проверку "
+                            "автоматически и продолжит сам.",
                             status=exc.status,
                         ) from exc
                     raise AvitoError(

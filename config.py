@@ -109,6 +109,10 @@ class Config:
     avito_browser_proxy: str | None
     avito_rotate_on_block: bool
     avito_block_pause_minutes: int
+    avito_auto_proxy: bool
+    avito_proxy_cache: Path
+    avito_proxy_scan_limit: int
+    avito_proxy_scan_workers: int
     avito_use_browser: bool
     avito_browser_headless: bool
     avito_browser_profile: Path
@@ -191,6 +195,12 @@ def load_config() -> Config:
         avito_block_pause_minutes=_env_int(
             "AVITO_BLOCK_PAUSE_MINUTES", 10, 1
         ),
+        avito_auto_proxy=_env_bool("AVITO_AUTO_PROXY", True),
+        avito_proxy_cache=_path_from_env(
+            "AVITO_PROXY_CACHE", BASE_DIR / "data" / "proxies_working.txt"
+        ),
+        avito_proxy_scan_limit=_env_int("AVITO_PROXY_SCAN_LIMIT", 450, 50),
+        avito_proxy_scan_workers=_env_int("AVITO_PROXY_SCAN_WORKERS", 100, 10),
         avito_use_browser=_env_bool("AVITO_USE_BROWSER", True),
         avito_browser_headless=_env_bool("AVITO_BROWSER_HEADLESS", False),
         avito_browser_profile=_path_from_env(

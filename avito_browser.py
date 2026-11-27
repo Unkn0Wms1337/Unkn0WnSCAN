@@ -342,28 +342,38 @@ class AvitoBrowser:
         return any(marker in lowered for marker in BLOCK_MARKERS)
 
     async def _try_pass_challenge(self, page) -> bool:
-        """Пробует нажать «Пройти проверку», если Авито её показал.
+        """Даёт антибот-проверке пройти самой, без участия человека.
 
-        Лёгкая PoW-проверка («проверка безопасности») проходит сама, её не
-        трогаем. Кнопка «Пройти проверку» открывает капчу — если она есть,
-        нажимаем, чтобы человеку было проще её пройти в открытом окне.
+        Лёгкая PoW-проверка («проверка безопасности») решается в JS за
+        несколько секунд. Кнопку «Пройти проверку» не нажимаем: за ней может
+        быть интерактивная капча. Вместо этого несколько раз перезагружаем
+        страницу — PoW запускается заново и обычно проходит сам.
         """
         try:
             body = (await self._body_text(page)).casefold()
         except Exception:
             return False
-        if "пройти проверку" not in body:
-            return False
-        try:
-            button = page.get_by_text("Пройти проверку", exact=True).first
-            if not await button.count():
-                return False
-            await button.click(timeout=2500)
-            logger.info("Avito: нажал «Пройти проверку» — пройдите капчу в окне")
-            await asyncio.sleep(2.0)
-            return True
-        except Exception:  # noqa: BLE001
-            return False
+        return "пройти проверку" in body or "проверка безопасности" in body
+
+    async def _auto_recover(self, page, url: str, attempts: int = 2) -> list[dict]:
+        """Автоматически перезагружает страницу, пока PoW не пропустит."""
+        items: list[dict] = []
+        for attempt in range(max(1, attempts)):
+            await asyncio.sleep(12.0 + 6.0 * attempt)
+            try:
+                await page.goto(
+                    url, wait_until="domcontentloaded", timeout=self._timeout_ms
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            items = await self._wait_items(page, 20000)
+            if items:
+                logger.info(
+                    "Avito: проверка пройдена автоматически (попытка %s)",
+                    attempt + 1,
+                )
+                return items
+        return items
 
     async def _wait_items(self, page, timeout_ms: int) -> list[dict]:
         """Ждёт карточки, давая антибот-проверке время пройти самой."""
@@ -410,14 +420,13 @@ class AvitoBrowser:
                 # на нём — ждём ручного прохождения.
                 if on_target and not force and not items and on_challenge:
                     # Лёгкая проверка («проверка безопасности») проходит сама
-                    # за несколько секунд. Даём ей время, а капчу предлагаем
-                    # пройти человеку в открытом окне.
+                    # за несколько секунд; если нет — перезагружаем страницу
+                    # и даём PoW отработать заново, без участия человека.
                     logger.info("Avito: проверка безопасности, жду прохождения")
                     items = await self._wait_items(page, 12000)
                     if items:
                         return items
-                    await self._try_pass_challenge(page)
-                    items = await self._wait_items(page, 12000)
+                    items = await self._auto_recover(page, url, attempts=2)
                     if items:
                         return items
                     raise BrowserFetchError(
@@ -467,8 +476,12 @@ class AvitoBrowser:
                     return items
                 body = await self._body_text(page)
                 if self._is_challenge(body):
-                    # Последний шанс: иногда PoW отвечает чуть позже.
+                    # Последний шанс: иногда PoW отвечает чуть позже, а иногда
+                    # помогает только повторная загрузка целевого URL.
                     items = await self._wait_items(page, 10000)
+                    if items:
+                        return items
+                    items = await self._auto_recover(page, url, attempts=2)
                     if items:
                         return items
                     raise BrowserFetchError(

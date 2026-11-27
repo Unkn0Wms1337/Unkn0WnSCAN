@@ -467,6 +467,10 @@ async def run(config: Config) -> None:
         browser_proxy=config.avito_browser_proxy,
         rotate_on_block=config.avito_rotate_on_block,
         block_pause_minutes=config.avito_block_pause_minutes,
+        auto_proxy=config.avito_auto_proxy,
+        proxy_cache_path=str(config.avito_proxy_cache),
+        proxy_scan_limit=config.avito_proxy_scan_limit,
+        proxy_scan_workers=config.avito_proxy_scan_workers,
     )
     client = build_telegram_client(config)
     monitor: Monitor | None = None
@@ -503,6 +507,11 @@ async def run(config: Config) -> None:
         register_handlers(client, storage, monitor, all_russia=config.avito_all_russia)
         with contextlib.suppress(Exception):
             await set_commands(client)
+
+        # Если есть кэш рабочих прокси с прошлой блокировки — включаем его
+        # до первой проверки, чтобы не тратить время на заблокированный IP.
+        with contextlib.suppress(Exception):
+            await avito_client.preload_cached_proxies()
 
         monitor_task = asyncio.create_task(monitor.run_forever())
         logger.info("Подписок в базе: %s", len(storage.list_subscriptions()))
