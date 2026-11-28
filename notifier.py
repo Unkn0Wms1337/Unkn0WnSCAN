@@ -16,7 +16,7 @@ from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from telethon.tl.custom import Button
 
-from avito import Listing, seller_token
+from avito import Listing
 from formatter import format_listing_caption
 
 logger = logging.getLogger(__name__)
@@ -26,21 +26,11 @@ MAX_BUTTON_URL = 1900
 
 
 def listing_buttons(listing: Listing):
-    """Кнопки под объявлением: открыть на Авито и заблокировать продавца."""
+    """Кнопка перехода к объявлению на Авито."""
     url = (listing.url or "").strip()
     rows = []
     if url and len(url) <= MAX_BUTTON_URL:
         rows.append([Button.url("✈️ Открыть на Авито", url)])
-    token = seller_token(listing.seller_id)
-    if token:
-        rows.append(
-            [
-                Button.inline(
-                    "🚫 Заблокировать продавца",
-                    f"block:{token}".encode("utf-8"),
-                )
-            ]
-        )
     return rows or None
 
 MAX_PHOTO_BYTES = 15 * 1024 * 1024
