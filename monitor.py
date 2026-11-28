@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
 import time
 from dataclasses import replace
 
@@ -435,10 +434,8 @@ class Monitor:
             if subscriptions:
                 await asyncio.gather(*(check_one(item) for item in subscriptions))
             try:
-                # Небольшой разброс, чтобы запросы не шли строго по секундомеру.
-                jitter = random.uniform(0, min(12.0, max(0.4, self.interval * 0.2)))
                 await asyncio.wait_for(
-                    self._stop.wait(), timeout=self.interval + jitter
+                    self._stop.wait(), timeout=self.interval
                 )
             except asyncio.TimeoutError:
                 pass

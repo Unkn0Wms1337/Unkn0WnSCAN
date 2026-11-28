@@ -188,7 +188,7 @@ def load_config() -> Config:
         mt_proxy_server=proxy_server,
         mt_proxy_port=proxy_port,
         mt_proxy_secret=proxy_secret,
-        check_interval=_env_int("CHECK_INTERVAL_SECONDS", 300, 1),
+        check_interval=_env_int("CHECK_INTERVAL_SECONDS", 60, 1),
         initial_pages=_env_int("INITIAL_PAGES", 2, 1),
         check_pages=_env_int("CHECK_PAGES", 1, 1),
         request_delay=_env_float("REQUEST_DELAY_SECONDS", 2.0, 0.5),
