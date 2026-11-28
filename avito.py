@@ -1599,7 +1599,7 @@ class AvitoClient:
             now = asyncio.get_running_loop().time()
             wait_for = self._request_delay - (now - self._last_request_at)
             if wait_for > 0:
-                await asyncio.sleep(wait_for + random.uniform(0, 0.4))
+                await asyncio.sleep(wait_for)
             self._last_request_at = asyncio.get_running_loop().time()
 
     def _load_state(self) -> None:
@@ -2159,8 +2159,8 @@ class AvitoClient:
             all_items.extend(page_items)
             if len(page_items) < 10:
                 break
-            if page < pages:
-                await asyncio.sleep(random.uniform(3.0, 6.0))
+            # Между страницами действует общий throttle запросов; отдельная
+            # многосекундная пауза здесь только задерживала уведомление.
 
         self._reset_block()
         by_id: dict[str, Listing] = {}

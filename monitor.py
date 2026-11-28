@@ -217,7 +217,6 @@ class Monitor:
         cutoff = time.time() - self.fresh_window
 
         accepted: list[Listing] = []
-        checked = 0
         for item in new_items:
             published = item.published_ts
             precise = item.published_precise
@@ -241,10 +240,7 @@ class Monitor:
             # Точное время публикации («1 час назад», «сегодня в 21:14»)
             # читаем из карточки, не уходя со страницы поиска. Оттуда же
             # берём описание и данные продавца для подписи к фото.
-            if checked:
-                await asyncio.sleep(0.3)
             exact, exact_precise, detail = await self.avito.fetch_item_info(item.url)
-            checked += 1
             if detail:
                 item = replace(
                     item,
@@ -313,7 +309,7 @@ class Monitor:
         )
 
         to_send = accepted[: self.max_new_per_check]
-        for index, item in enumerate(to_send):
+        for item in to_send:
             enriched = item
             if self.fetch_details:
                 try:
@@ -343,8 +339,6 @@ class Monitor:
                 logger.exception("Не удалось отправить объявление %s", item.id)
                 break
             self.storage.mark_seen(subscription.id, [item.id])
-            if index < len(to_send) - 1:
-                await asyncio.sleep(0.7)
 
         self.storage.mark_checked(subscription.id, fresh_market)
         if to_send:
@@ -383,7 +377,7 @@ class Monitor:
         market = robust_market_price(item.price for item in listings)
         to_send = listings[: max(1, limit)]
         sent = 0
-        for index, item in enumerate(to_send):
+        for item in to_send:
             try:
                 await send_listing(
                     self.client,
@@ -400,8 +394,6 @@ class Monitor:
                 logger.exception("Не удалось отправить объявление %s", item.id)
                 break
             sent += 1
-            if index < len(to_send) - 1:
-                await asyncio.sleep(0.7)
 
         if len(listings) > sent:
             await self._send_text(
@@ -414,6 +406,7 @@ class Monitor:
     async def run_forever(self) -> None:
         logger.info("Мониторинг запущен, интервал %s сек.", self.interval)
         while not self._stop.is_set():
+            cycle_started = asyncio.get_running_loop().time()
             subscriptions = self.storage.list_subscriptions()
             # Не проверяем подписки последовательно: медленный поиск или
             # отправка нескольких объявлений в одном чате не должен отодвигать
@@ -434,8 +427,13 @@ class Monitor:
             if subscriptions:
                 await asyncio.gather(*(check_one(item) for item in subscriptions))
             try:
+                remaining = max(
+                    0.0,
+                    self.interval
+                    - (asyncio.get_running_loop().time() - cycle_started),
+                )
                 await asyncio.wait_for(
-                    self._stop.wait(), timeout=self.interval
+                    self._stop.wait(), timeout=remaining
                 )
             except asyncio.TimeoutError:
                 pass
